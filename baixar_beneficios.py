@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import csv
 import random
@@ -43,10 +44,9 @@ REQUEST_INTERVAL = 1
 # Interval (seconds) after which we re-fetch cookies (challenge renew)
 CHALLENGE_RENEW_INTERVAL = 60
 
-# How many times to retry the same offset if we get an error (like timeout)
+# How many times to retry the same offset if we get an error
 MAX_ATTEMPTS = 3
 
-# Cabeçalhos adicionais
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -57,7 +57,6 @@ HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9",
     "X-Requested-With": "XMLHttpRequest",
 }
-
 
 # =============================================================================
 # FUNÇÕES AUXILIARES
@@ -86,9 +85,9 @@ def extract_id_municipio(link: str) -> str:
 
 def open_browser_and_get_cookies():
     """
-    Abre um Chrome 'undetected' e visita a página principal para
-    obter cookies do WAF challenge.
-    Retorna os cookies (list of dict).
+    Abre Chrome via undetected-chromedriver, visita a página principal
+    para resolver o desafio WAF, aguarda ~15s e pega cookies.
+    Retorna uma list[dict] de cookies.
     """
     chrome_options = Options()
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
@@ -100,16 +99,18 @@ def open_browser_and_get_cookies():
 
     print("[Desafio] Abrindo o navegador para obter cookies...")
     driver.get(URL_PRINCIPAL)
-    # Aguarde tempo suficiente para resolver JS challenge
-    time.sleep(15)  # Ajuste se necessário
+    time.sleep(15)  # Ajuste se necessário para o WAF challenge
 
     cookies = driver.get_cookies()
+    # Fecha explicitamente e remove a referência:
     driver.quit()
+    driver = None
+
     return cookies
 
 def inject_cookies(sess: requests.Session, cookie_list):
     """
-    Injeta cookies (list of dict from Selenium) na Session do requests.
+    Injeta os cookies (list of dict, do Selenium) na Session do requests.
     """
     for c in cookie_list:
         domain = c.get("domain", "portaldatransparencia.gov.br")
@@ -118,7 +119,7 @@ def inject_cookies(sess: requests.Session, cookie_list):
 def baixar_dados_ano(session: requests.Session, ano: int, last_challenge_time: float):
     """
     Faz as requisições paginadas usando a 'session'.
-    Retorna 'session, last_challenge_time' para continuar no fluxo principal.
+    Retorna (session, last_challenge_time) ao final.
     """
     offset = 0
     csv_filename = os.path.join(DOWNLOADS_FOLDER, f"bolsafamilia_{ano}_{UF}.csv")
@@ -146,7 +147,6 @@ def baixar_dados_ano(session: requests.Session, ano: int, last_challenge_time: f
 
             print(f"[{ano}] Requisição com offset={offset}")
 
-            # We'll implement a retry loop for each offset
             attempts = 0
             while attempts < MAX_ATTEMPTS:
                 try:
@@ -162,9 +162,9 @@ def baixar_dados_ano(session: requests.Session, ano: int, last_challenge_time: f
                     }
 
                     resp = session.get(URL_BASE, params=params, headers=HEADERS, timeout=30)
-                    status = resp.status_code
+                    code = resp.status_code
 
-                    if status == 403:
+                    if code == 403:
                         print("HTTP 403 - Bloqueado. Renovando cookies e tentando novamente.")
                         new_cookies = open_browser_and_get_cookies()
                         session = requests.Session()
@@ -172,17 +172,16 @@ def baixar_dados_ano(session: requests.Session, ano: int, last_challenge_time: f
                         last_challenge_time = time.time()
                         attempts += 1
                         time.sleep(5)
-                        continue  # retry same offset
-                    elif status == 202:
+                        continue
+                    elif code == 202:
                         print("HTTP 202 (Accepted) - Aguardando 5s e tentando de novo...")
                         attempts += 1
                         time.sleep(5)
-                        continue  # retry same offset
-                    elif status != 200:
-                        print(f"HTTP {status}. Encerrando loop para ano {ano}.")
+                        continue
+                    elif code != 200:
+                        print(f"HTTP {code} - Encerrando loop para ano {ano}.")
                         return session, last_challenge_time
 
-                    # If 200 OK, parse JSON
                     data_json = resp.json()
                     if data_json.get("error") is not None:
                         print(f"Erro retornado pela API: {data_json['error']}")
@@ -193,9 +192,9 @@ def baixar_dados_ano(session: requests.Session, ano: int, last_challenge_time: f
                         print(f"Nenhum registro encontrado (offset={offset}). Encerrando ano {ano}.")
                         return session, last_challenge_time
 
-                    # Write each record to CSV
+                    # Se chegou aqui, parseamos com sucesso
                     for item in registros:
-                        link = item.get("linkDetalhamento") or ""
+                        link = item.get("linkDetalhamento", "")
                         id_municipio = extract_id_municipio(link)
                         valor_float = parse_valor(item.get("valor", ""))
 
@@ -213,45 +212,49 @@ def baixar_dados_ano(session: requests.Session, ano: int, last_challenge_time: f
                         }
                         writer.writerow(row)
 
-                    # If we got here successfully, break from attempts loop
+                    # Se deu tudo certo, break do attempts loop
                     break
 
                 except Exception as e:
                     attempts += 1
                     print(f"Erro inesperado no offset={offset}, tentativa {attempts}/{MAX_ATTEMPTS}: {e}")
-                    # We'll re-challenge just in case
+                    # Re-challenge
                     new_cookies = open_browser_and_get_cookies()
                     session = requests.Session()
                     inject_cookies(session, new_cookies)
                     last_challenge_time = time.time()
                     time.sleep(5)
 
-            # If after MAX_ATTEMPTS we still fail, we stop this year
             if attempts >= MAX_ATTEMPTS:
                 print(f"Falhou {MAX_ATTEMPTS} vezes no offset={offset}. Encerrando ano {ano}.")
                 return session, last_challenge_time
 
-            # If we succeeded, increment offset and wait before next page
+            # Offset concluído, vamos para o próximo
             offset += TAMANHO_PAGINA
             time.sleep(REQUEST_INTERVAL)
 
     print(f"Finalizado ano {ano}. CSV: {csv_filename}")
     return session, last_challenge_time
 
+
 def main():
-    # Primeira vez: abre browser para pegar cookies
+    # 1) Primeira vez: abre browser para pegar cookies
     cookies = open_browser_and_get_cookies()
 
-    # Cria session e injeta cookies
+    # 2) Cria session e injeta cookies
     session = requests.Session()
     inject_cookies(session, cookies)
 
     last_challenge_time = time.time()
 
+    # 3) Itera anos
     for ano in ANOS:
         session, last_challenge_time = baixar_dados_ano(session, ano, last_challenge_time)
 
     print("Processo concluído.")
+    # Força encerramento total do script
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
